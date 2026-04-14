@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>PSD Editor</title>
+<style>
+body { font-family: Arial; margin:0; display:flex; height:100vh; background:#f0f0f0; }
+#main { flex:1; display:flex; flex-direction:column; padding:10px; overflow:auto; }
+#dropzone { border:2px dashed #999; background:#fff; padding:30px; text-align:center; margin-bottom:5px; cursor:pointer; }
+#dropzone.dragover { border-color:#333; background:#eee; }
+#compositeContainer { flex:1; text-align:center; overflow:auto; background:#e9e9e9; border:1px solid #ccc; border-radius:4px; padding:10px; }
+canvas { transform: scale(0.4); transform-origin: top left; margin:5px 0; }
+#sidebar { width:250px; background:#fff; border-left:1px solid #ccc; overflow-y:auto; padding:10px; display:flex; flex-direction:column; }
+#sidebar h2 { font-size:16px; margin:5px 0; }
+.layer-item { padding:5px; margin-bottom:4px; cursor:pointer; border-radius:3px; display:flex; align-items:center; }
+.layer-item:hover { background:#e3f2fd; }
+.layer-item.active { background:#cce5ff; }
+.layer-type { font-size:10px; padding:2px 4px; border-radius:3px; margin-left:auto; }
+.layer-type.text { background:#d1ecf1; color:#0c5460; }
+.layer-type.image { background:#d4edda; color:#155724; }
+.layer-type.overlay { background:#fff3cd; color:#856404; }
+#editPanel { margin-top:5px; background:#fff; padding:10px; border-radius:4px; border:1px solid #ccc; display:none; }
+#editPanel label { display:block; margin-top:5px; font-weight:bold; }
+#editPanel textarea { width:100%; height:60px; }
+#editPanel input[type="file"] { width:100%; }
+#status { font-size:12px; color:#333; margin-top:3px; }
+#debugPanel { font-size:10px; color:#555; height:100px; overflow-y:auto; background:#f9f9f9; padding:5px; border:1px solid #ccc; margin-top:5px; }
+</style>
+</head>
+<body>
+
+<div id="main">
+  <div id="dropzone">Drag & drop PSD here or click to open</div>
+  <input type="file" id="fileInput" accept=".psd" style="display:none">
+  <div id="status"></div>
+  <div id="compositeContainer"></div>
+  <div id="editPanel">
+    <div id="textEditor">
+      <label for="textContent">Edit Text:</label>
+      <textarea id="textContent"></textarea>
+      <button id="updateTextBtn">Update Text</button>
+    </div>
+    <div id="imageEditor">
+      <label for="imageInput">Replace Image:</label>
+      <input type="file" id="imageInput" accept="image/*">
+      <button id="updateImageBtn">Update Image</button>
+    </div>
+  </div>
+  <div id="debugPanel"></div>
+</div>
+
+<div id="sidebar">
+  <h2>Layers</h2>
+  <div id="layerList"></div>
+</div>
+
+<!-- AG-PSD library (fixed working CDN) -->
+<script src="https://cdn.jsdelivr.net/npm/ag-psd@28.3.1/dist/ag-psd.umd.js"></script>
+
+<script>
+window.addEventListener('load', function() {
+  if(typeof agPsd==='undefined'){ alert('AG-PSD library failed to load.'); return; }
+
+  let psdData=null, selectedLayer=null, compositeCanvas=null, compositeCtx=null;
+
+  const dropzone=document.getElementById('dropzone');
+  const fileInput=document.getElementById('fileInput');
+  const status=document.getElementById('status');
+  const layerList=document.getElementById('layerList');
+  const compositeContainer=document.getElementById('compositeContainer');
+  const editPanel=document.getElementById('editPanel');
+  const textEditor=document.getElementById('textEditor');
+  const textContent=document.getElementById('textContent');
+  const updateTextBtn=document.getElementById('updateTextBtn');
+  const imageEditor=document.getElementById('imageEditor');
+  const imageInput=document.getElementById('imageInput');
+  const updateImageBtn=document.getElementById('updateImageBtn');
+  const debugPanel=document.getElementById('debugPanel');
+
+  function debugLog(msg){ console.log(msg); debugPanel.textContent+=msg+"\n"; debugPanel.scrollTop=debugPanel.scrollHeight; }
+  function showStatus(msg){ status.textContent=msg; }
+
+  function initApp(){
+    dropzone.addEventListener('click',()=>fileInput.click());
+    dropzone.addEventListener('dragover',e=>{ e.preventDefault(); dropzone.classList.add('dragover'); });
+    dropzone.addEventListener('dragleave',()=>dropzone.classList.remove('dragover'));
+    dropzone.addEventListener('drop',e=>{ e.preventDefault(); dropzone.classList.remove('dragover'); if(e.dataTransfer.files.length>0) handleFile(e.dataTransfer.files[0]); });
+    fileInput.addEventListener('change',e=>{if(e.target.files.length>0) handleFile(e.target.files[0]);});
+
+    updateTextBtn.addEventListener('click',()=>{
+      if(selectedLayer && selectedLayer.text){
+        selectedLayer.text.text=textContent.value;
+        createLayerCanvas(selectedLayer,true);
+        renderComposite();
+      }
+    });
+
+    updateImageBtn.addEventListener('click',()=>{
+      if(selectedLayer && imageInput.files.length>0){
+        const file=imageInput.files[0];
+        const reader=new FileReader();
+        reader.onload=function(e){
+          const img=new Image();
+          img.onload=function(){
+            const width=selectedLayer.width||img.width;
+            const height=selectedLayer.height||img.height;
+            const canvas=document.createElement('canvas');
+            canvas.width=width; canvas.height=height;
+            const ctx=canvas.getContext('2d');
+            ctx.clearRect(0,0,width,height);
+            ctx.drawImage(img,0,0,width,height);
+            selectedLayer.canvas=canvas;
+            renderComposite();
+          };
+          img.src=e.target.result;
+        };
+        reader.readAsDataURL(file);
+      }
+    });
+  }
+
+  function handleFile(file){
+    debugLog(`Handling file: ${file.name}`);
+    showStatus('Processing PSD...');
+    const reader=new FileReader();
+    reader.onload=function(e){
+      try{
+        psdData=agPsd.readPsd(e.target.result,{skipLayerImageData:false,skipCompositeImageData:false});
+        debugLog(`PSD parsed: ${psdData.width}x${psdData.height}`);
+        createCompositeCanvas();
+        generateAllLayerCanvases(psdData.children);
+        buildLayerSidebar();
+        renderComposite();
+        showStatus('PSD loaded');
+      }catch(err){ debugLog('Error parsing PSD: '+err.message); showStatus('Error: '+err.message);}
+    };
+    reader.readAsArrayBuffer(file);
+  }
+
+  function createCompositeCanvas(){
+    compositeContainer.innerHTML='';
+    compositeCanvas=document.createElement('canvas');
+    compositeCanvas.width=psdData.width;
+    compositeCanvas.height=psdData.height;
+    compositeCtx=compositeCanvas.getContext('2d');
+    compositeContainer.appendChild(compositeCanvas);
+  }
+
+  function generateAllLayerCanvases(layers){
+    layers.forEach(layer=>{ createLayerCanvas(layer); if(layer.children && layer.children.length>0) generateAllLayerCanvases(layer.children); });
+  }
+
+  function createLayerCanvas(layer, forceText=false){
+    if(layer.text && (forceText || !layer.canvas)){
+      const canvas=document.createElement('canvas');
+      canvas.width=layer.width||200; canvas.height=layer.height||50;
+      const ctx=canvas.getContext('2d'); ctx.clearRect(0,0,canvas.width,canvas.height);
+      let fillColor='black';
+      if(layer.text.style && layer.text.style.fillColor){
+        const c=layer.text.style.fillColor;
+        fillColor=`rgb(${Math.round(c.r)},${Math.round(c.g)},${Math.round(c.b)})`;
+      }
+      ctx.fillStyle=fillColor;
+      let fontSize=16; if(layer.text.style && layer.text.style.fontSize) fontSize=layer.text.style.fontSize;
+      let fontFamily='Arial'; if(layer.text.style && layer.text.style.font && layer.text.style.font.name) fontFamily=layer.text.style.font.name;
+      ctx.font=`${fontSize}px ${fontFamily}`; ctx.textBaseline='top';
+      ctx.fillText(layer.text.text||'',0,0);
+      layer.canvas=canvas;
+    } else if(layer.canvasData && !layer.canvas){
+      const canvas=document.createElement('canvas');
+      canvas.width=layer.width||layer.canvasData.width;
+      canvas.height=layer.height||layer.canvasData.height;
+      const ctx=canvas.getContext('2d');
+      if(layer.canvasData.data){
+        const imageData = ctx.createImageData(canvas.width,canvas.height);
+        imageData.data.set(layer.canvasData.data);
+        ctx.putImageData(imageData,0,0);
+      }
+      layer.canvas=canvas;
+    }
+  }
+
+  function buildLayerSidebar(){
+    layerList.innerHTML='';
+    if(psdData.children) processLayersSidebar(psdData.children, layerList);
+  }
+
+  function processLayersSidebar(layers,parentEl){
+    [...layers].reverse().forEach(layer=>{
+      const item=document.createElement('div'); item.className='layer-item';
+      let type='unknown';
+      if(layer.text) type='text';
+      else if(layer.name.toLowerCase().includes('overlay')) type='overlay';
+      else type='image';
+      const typeLabel=document.createElement('span'); typeLabel.className='layer-type '+type; typeLabel.textContent=type; item.textContent=layer.name; item.appendChild(typeLabel);
+      item.addEventListener('click',()=>{ selectedLayer=layer; editPanel.style.display='block'; if(type==='text') textContent.value=layer.text.text||''; });
+      parentEl.appendChild(item);
+      if(layer.children && layer.children.length>0) processLayersSidebar(layer.children,item);
+    });
+  }
+
+  function renderComposite(){
+    if(!compositeCtx) return;
+    compositeCtx.clearRect(0,0,compositeCanvas.width,compositeCanvas.height);
+    function renderLayers(layers){
+      layers.forEach(layer=>{
+        if(layer.visible!==false && layer.canvas){
+          compositeCtx.drawImage(layer.canvas,layer.left||0,layer.top||0);
+        }
+        if(layer.children && layer.children.length>0) renderLayers(layer.children);
+      });
+    }
+    renderLayers(psdData.children);
+  }
+
+  initApp();
+});
+</script>
+</body>
+</html>
